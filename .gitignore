@@ -1,0 +1,27 @@
+# environment ignore
+.cache
+.config
+.dotnet
+.local
+.ssh
+.vscode-server
+
+# airflow ignore
+airflow/config
+airflow/logs
+airflow/dags/__pycache__
+airflow/.env
+airflow/docker-compose.yaml
+
+# python venv ignore
+google_cloud/
+
+# bash ignore
+.bash_history
+.bash_logout
+.bashrc
+.profile
+.python_history
+.wget-hsts
+basic_settings.sh
+docker_install.sh
