@@ -10,9 +10,9 @@ from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobO
 from airflow.providers.http.operators.http import HttpOperator
 
 import json
+import numpy as np
 import pandas as pd
-from io import BytesIO
-from pytz import timezone
+from pprint import pprint
 
 default_args = {
     'owner': 'saeran.iren',
@@ -28,7 +28,7 @@ def parse_response(**context):
 
     if not response_text:
         print("No response received from XCom.")
-        return
+        raise
 
     try:
         response_json = json.loads(response_text)
@@ -42,15 +42,11 @@ def parse_response(**context):
 
     except json.JSONDecodeError:
         print(" JSON decoding failed.")
-        return
+        raise
 
 def upload_to_bigquery(**context):
     ti = context['ti']
     records = ti.xcom_pull(task_ids='parse_api_response', key='parsed_items')
-
-    # 인증정보 데이터
-    key_path = Variable.get('GCP_ACCOUNT_FILE_PATH')
-    credentials = service_account.Credentials.from_service_account_file(key_path)
 
     # XCom 데이터가 없을 시
     if not records:
@@ -60,17 +56,40 @@ def upload_to_bigquery(**context):
     try:
         df = pd.json_normalize(records)
 
-        # 문자열로 들어온 숫자 필드를 명시적으로 float으로 변환
-        # 숫자 필드에서 '-' 같은 문자열을 None으로 바꾸기 (to_numeric 전에)
-        float_columns = ['o3Value', 'pm10Value', 'pm25Value', 'coValue', 'no2Value', 'so2Value']
-        for col in float_columns:
-            if col in df.columns:
-                df[col] = df[col].replace({'-': None})
-        
-        # 그 다음에 숫자 변환
-        for col in float_columns:
-            if col in df.columns:
+        # '24:00'이 포함된 행이 하나라도 있는지 확인
+        if df['dataTime'].str.contains('24:00', na=False).any():
+            mask_24 = df['dataTime'].str.contains('24:00', na=False)
+
+            # 날짜만 추출한 후 하루를 더하고, '00:00' 형식으로 다시 넣기
+            df.loc[mask_24, 'dataTime'] = (
+                pd.to_datetime(df.loc[mask_24, 'dataTime'].str[:10]) + pd.Timedelta(days=1)
+            ).dt.strftime('%Y-%m-%d 00:00')
+
+        # dateTime 형변환
+        df['dataTime'] = pd.to_datetime(df['dataTime'])
+        df['dataTime'] = df['dataTime'].dt.strftime('%Y-%m-%d %H:%M')
+
+        # float 처리
+        float_columns = ['so2Value', 'o3Value', 'no2Value',
+                         'pm10Value', 'pm10Value24', 'pm25Value', 'pm25Value24']
+
+        # int 처리
+        int_columns = ['khaiValue', 'khaiGrade', 'so2Grade', 'coGrade',
+                       'o3Grade', 'no2Grade', 'pm10Grade', 'pm25Grade',
+                       'pm10Grade1h', 'pm25Grade1h']
+
+        # 형변환
+        for col in df.columns:
+            if col in float_columns and col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
+                df[col] = df[col].replace({np.nan: None})
+
+            elif col in int_columns and col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                df[col] = df[col].astype('Int64').replace({pd.NA: None})
+
+                # Int64 타입을 일반 int로 변환 (JSON 직렬화를 위해)
+                df[col] = df[col].astype(object).where(df[col].notna(), None)
 
         # 이상값 처리
         df = df.replace({pd.NA: None, pd.NaT: None, float('nan'): None, '-': None})
@@ -78,7 +97,11 @@ def upload_to_bigquery(**context):
 
         if df.empty:
             print("DataFrame is empty. Nothing to load to BigQuery")
-            return
+            raise
+
+        # 인증정보 데이터
+        key_path = Variable.get('GCP_ACCOUNT_FILE_PATH')
+        credentials = service_account.Credentials.from_service_account_file(key_path)
 
         # Table Info
         project_id = 'vibrant-map-459723-k4'
@@ -107,9 +130,23 @@ def upload_to_bigquery(**context):
             autodetect = True,
         )
 
+        # JSON으로 안전하게 변환 - 특별히 특수 값 처리 추가
+        # DataFrame을 dict 리스트로 변환하고 NaN 값 처리
+        records_list = []
+
+        for _, row in df.iterrows():
+            row_dict = {}
+            for col, val in row.items():
+                # np.nan, pd.NA 등을 None으로 변환
+                if pd.isna(val) or val is pd.NA:
+                    row_dict[col] = None
+                else:
+                    row_dict[col] = val
+            records_list.append(row_dict)
+
         # JSON object list direvtly passed
         job = client.load_table_from_json(
-            df.to_dict(orient='records'),
+            records_list,
             destination=table_ref,
             job_config=job_config
             )
@@ -120,19 +157,19 @@ def upload_to_bigquery(**context):
 
     except Exception as e:
         print(f"Failed to load JSON into DataFrame: {e}")
-        return
+        raise
 
 with DAG(
     dag_id='data_extract_transform_load',
     start_date=pendulum.datetime(2025, 5, 1, tz='Asia/Seoul'),
-    schedule="20 * * * *",
-    tags=['Extract'],
+    schedule="55 * * * *",
+    tags=['Extract', 'Transform', 'Load'],
     default_args=default_args,
     catchup=False
 ) as dag:
 
     api_task = HttpOperator(
-        task_id=f'api_authentication',
+        task_id='api_authentication',
         method='GET',
         http_conn_id='datagokr_apikey',
         endpoint='/B552584/ArpltnInforInqireSvc/getCtprvnRltmMesureDnsty',
